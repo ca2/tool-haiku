@@ -3,8 +3,47 @@
 set -u
 
 
+#
+# ----------------------------------------------------------------------
+# Top-level recursion guard
+#
+# Prevent commit from launching another commit process.
+# ----------------------------------------------------------------------
+#
+
+if [ "${CA2_COMMIT_RUNNING:-0}" = "1" ]; then
+
+    echo "ERROR: Recursive invocation of commit detected." >&2
+    echo "commit must not invoke commit, checkout, or another operation" >&2
+    echo "that eventually invokes commit again." >&2
+
+    exit 1
+
+fi
+
+export CA2_COMMIT_RUNNING=1
+
+
+#
+# ----------------------------------------------------------------------
+# Per-phase visited repository lists
+#
+# These prevent recursive/cyclic submodule graphs from causing an
+# infinite loop inside the same Bash process.
+#
+# Each phase needs its own list because a repository legitimately needs
+# to be visited once in each phase.
+# ----------------------------------------------------------------------
+#
+
+COMMIT_VISITED=""
+PREFLIGHT_VISITED=""
+PUSH_VISITED=""
+
+
 DEDICATORY_FILE="$HOME/dedicatory.txt"
 PENDING_MERGES_FILE="commit_pending_merges.txt"
+
 
 #
 # ca2 and cpp-port repositories are writable repositories.
@@ -19,16 +58,22 @@ ERROR_RESET=""
 SUCCESS_RESET=""
 
 
-if [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != "dumb" ]; then
+if [ -z "${NO_COLOR+x}" ] &&
+   [ "${TERM:-}" != "dumb" ]; then
 
     if [ -t 2 ]; then
+
         ERROR_COLOR=$'\033[1;31m'
         ERROR_RESET=$'\033[0m'
+
     fi
 
+
     if [ -t 1 ]; then
+
         SUCCESS_COLOR=$'\033[1;34m'
         SUCCESS_RESET=$'\033[0m'
+
     fi
 
 fi
@@ -36,52 +81,117 @@ fi
 
 print_error()
 {
+
     printf '%s%s%s\n' \
         "$ERROR_COLOR" \
         "$*" \
         "$ERROR_RESET" >&2
+
 }
 
 
 print_success()
 {
+
     printf '%s%s%s\n' \
         "$SUCCESS_COLOR" \
         "$*" \
         "$SUCCESS_RESET"
+
 }
 
 
 pushd()
 {
+
     command pushd "$@" > /dev/null
+
 }
 
 
 popd()
 {
+
     command popd "$@" > /dev/null
+
 }
 
 
 is_owned_remote()
 {
+
     local url="$1"
 
     [[ "$url" =~ $OWNED_REMOTE_REGEX ]]
+
+}
+
+
+#
+# Return the physical canonical top-level directory of a repository.
+#
+# pwd -P resolves symbolic links, which helps detect cases where the
+# same repository is reached through two different filesystem paths.
+#
+
+canonical_repository_root()
+{
+
+    local directory="$1"
+    local root
+
+
+    root=$(git -C "$directory" \
+        rev-parse \
+        --show-toplevel \
+        2>/dev/null) || return 1
+
+
+    (
+        cd "$root" || exit 1
+        pwd -P
+    )
+
+}
+
+
+#
+# Check whether a canonical repository path is already present in
+# a newline-separated visited list.
+#
+
+repository_was_visited()
+{
+
+    local visited="$1"
+    local repository="$2"
+
+
+    if [ -z "$visited" ]; then
+
+        return 1
+
+    fi
+
+
+    printf '%s\n' "$visited" |
+        grep -Fqx -- "$repository"
+
 }
 
 
 get_submodule_remote_url()
 {
+
     local submodule_name="$1"
     local submodule_path="$2"
     local url
 
 
     #
-    # `git submodule init/sync` resolves relative .gitmodules URLs
-    # against the parent's origin and stores the usable SSH URL here.
+    # git submodule init/sync resolves relative .gitmodules URLs
+    # against the parent's origin and stores the usable URL here.
+    #
     # Prefer that resolved value for ownership decisions.
     #
 
@@ -113,11 +223,13 @@ get_submodule_remote_url()
 
 
     printf '%s\n' "$url"
+
 }
 
 
 get_branch()
 {
+
     local configured_branch="${1:-}"
     local branch
 
@@ -145,6 +257,7 @@ get_branch()
         --short HEAD \
         2>/dev/null || true)
 
+
     if [ -n "$branch" ]; then
 
         printf '%s\n' "$branch"
@@ -155,13 +268,15 @@ get_branch()
 
 
     #
-    # Detached submodule: use origin default.
+    # Detached submodule:
+    # use origin default branch if available.
     #
 
     branch=$(git symbolic-ref \
         --quiet \
         --short refs/remotes/origin/HEAD \
         2>/dev/null || true)
+
 
     if [ -n "$branch" ]; then
 
@@ -177,19 +292,23 @@ get_branch()
     #
 
     printf '%s\n' "main"
+
 }
 
 
 commit_is_available_from_origin()
 {
+
     local directory="$1"
     local commit="$2"
     local remote_tags
 
 
     #
-    # Refresh every advertised branch. A commit reachable from one of
-    # these refs is reproducible by a fresh clone.
+    # Refresh every advertised branch.
+    #
+    # A commit reachable from one of these refs is reproducible
+    # by a fresh clone.
     #
 
     if ! git -C "$directory" fetch \
@@ -214,9 +333,8 @@ commit_is_available_from_origin()
 
 
     #
-    # Also accept commits directly advertised by lightweight or
-    # annotated tags. The peeled ^{} line is the commit for an
-    # annotated tag.
+    # Also accept commits directly advertised by lightweight
+    # or annotated tags.
     #
 
     remote_tags=$(git -C "$directory" ls-remote \
@@ -235,11 +353,13 @@ commit_is_available_from_origin()
 
 
     return 1
+
 }
 
 
 verify_external_submodule_commit()
 {
+
     local submodule_path="$1"
     local submodule_url="$2"
     local commit
@@ -248,6 +368,7 @@ verify_external_submodule_commit()
     commit=$(git -C "$submodule_path" rev-parse HEAD)
 
 
+    echo
     echo "Verifying external submodule commit is published:"
     echo "   $submodule_path"
     echo "   $commit"
@@ -263,8 +384,11 @@ verify_external_submodule_commit()
 
 
     echo
-    print_error "ERROR: External submodule commit is not reachable from"
+    print_error \
+        "ERROR: External submodule commit is not reachable from"
+
     echo "any branch or tag advertised by its origin:"
+    echo
     echo "   Path   : $submodule_path"
     echo "   URL    : $submodule_url"
     echo "   Commit : $commit"
@@ -273,17 +397,20 @@ verify_external_submodule_commit()
 
 
     return 1
+
 }
 
 
 verify_published_head()
 {
+
     local branch="$1"
     local local_commit
     local remote_commit
 
 
     local_commit=$(git rev-parse HEAD)
+
 
     remote_commit=$(git ls-remote \
         --heads \
@@ -300,31 +427,39 @@ verify_published_head()
 
 
     echo
-    print_error "ERROR: Push returned without publishing the exact local HEAD."
+    print_error \
+        "ERROR: Push returned without publishing the exact local HEAD."
+
+    echo
     echo "   Branch        : $branch"
     echo "   Local HEAD    : $local_commit"
     echo "   Remote branch : ${remote_commit:-<missing>}"
 
 
     return 1
+
 }
 
 
 #
-# ----------------------------------------------------------------------
+# ======================================================================
 # PHASE 1
 #
 # Commit local work recursively, bottom-to-top.
 #
-# NO PUSHING happens in this phase.
-# ----------------------------------------------------------------------
+# NO CHECKOUT.
+# NO MERGE.
+# NO PUSH.
+# ======================================================================
 #
 
 commit_repository()
 {
+
     local directory="$1"
 
     local git_root
+    local canonical_root
     local key
     local submodule_path
     local submodule_name
@@ -358,6 +493,46 @@ commit_repository()
         return 1
 
     }
+
+
+    canonical_root=$(canonical_repository_root "$git_root") || {
+
+        popd
+
+        return 1
+
+    }
+
+
+    #
+    # Prevent recursive/cyclic repository traversal.
+    #
+
+    if repository_was_visited \
+        "$COMMIT_VISITED" \
+        "$canonical_root"; then
+
+        echo
+        echo "Already visited during commit phase:"
+        echo "   $canonical_root"
+        echo "Skipping to prevent recursive repository cycle."
+
+        popd
+
+        return 0
+
+    fi
+
+
+    if [ -z "$COMMIT_VISITED" ]; then
+
+        COMMIT_VISITED="$canonical_root"
+
+    else
+
+        COMMIT_VISITED="${COMMIT_VISITED}"$'\n'"${canonical_root}"
+
+    fi
 
 
     echo
@@ -416,7 +591,8 @@ commit_repository()
                 echo "   $submodule_path"
 
 
-                if ! commit_repository "$submodule_path"; then
+                if ! commit_repository \
+                    "$submodule_path"; then
 
                     popd
 
@@ -456,10 +632,7 @@ commit_repository()
 
 
     #
-    # Stage this repository's ordinary files and changed gitlinks only
-    # after every child has completed successfully. If a later sibling
-    # fails, the parent index remains untouched and checkout can repair
-    # the tree on the next convergence cycle.
+    # Stage repository after children are finished.
     #
 
     if ! git add -A -- .; then
@@ -490,6 +663,7 @@ commit_repository()
         fi
 
 
+        echo
         echo "Committing local changes."
 
 
@@ -512,24 +686,30 @@ commit_repository()
     popd
 
     return 0
+
 }
 
 
 #
-# ----------------------------------------------------------------------
+# ======================================================================
 # PHASE 2
 #
-# Detect repositories that need remote history merged.
-# ----------------------------------------------------------------------
+# Detect repositories requiring remote history to be merged.
+#
+# This phase does NOT checkout, merge, rebase, reset, or push.
+# ======================================================================
 #
 
 append_pending_merge()
 {
+
     local relative_path="$1"
 
 
     if [ -z "$relative_path" ]; then
+
         return
+
     fi
 
 
@@ -538,15 +718,18 @@ append_pending_merge()
         "$ROOT_PENDING_FILE" \
         2>/dev/null; then
 
-        printf '%s\n' "$relative_path" \
+        printf '%s\n' \
+            "$relative_path" \
             >> "$ROOT_PENDING_FILE"
 
     fi
+
 }
 
 
 repository_requires_merge()
 {
+
     local configured_branch="${1:-}"
 
     local branch
@@ -561,9 +744,13 @@ repository_requires_merge()
     echo "Fetching origin/$branch..."
 
 
-    if ! git fetch origin "$branch"; then
+    if ! git fetch \
+        origin \
+        "$branch"; then
 
-        echo "WARNING: Could not fetch origin/$branch."
+        echo
+        print_error \
+            "WARNING: Could not fetch origin/$branch."
 
         return 2
 
@@ -572,11 +759,8 @@ repository_requires_merge()
 
     if ! git show-ref \
         --verify \
-        --quiet "$remote_ref"; then
-
-        #
-        # No remote branch yet.
-        #
+        --quiet \
+        "$remote_ref"; then
 
         return 1
 
@@ -584,7 +768,10 @@ repository_requires_merge()
 
 
     #
-    # If remote is already an ancestor of local HEAD, no merge is needed.
+    # Remote already contained in local HEAD:
+    #
+    #   equal
+    #   or local ahead
     #
 
     if git merge-base \
@@ -598,20 +785,25 @@ repository_requires_merge()
 
 
     #
-    # Remote contains commits that HEAD doesn't contain.
+    # Remote contains commits local HEAD does not contain.
+    #
+    # This means local is behind or histories diverged.
     #
 
     return 0
+
 }
 
 
 preflight_repository()
 {
+
     local directory="$1"
     local root_relative_path="$2"
     local configured_branch="${3:-}"
 
     local git_root
+    local canonical_root
     local current_remote
 
     local key
@@ -649,6 +841,46 @@ preflight_repository()
     }
 
 
+    canonical_root=$(canonical_repository_root "$git_root") || {
+
+        popd
+
+        return 1
+
+    }
+
+
+    #
+    # Prevent recursive/cyclic repository traversal.
+    #
+
+    if repository_was_visited \
+        "$PREFLIGHT_VISITED" \
+        "$canonical_root"; then
+
+        echo
+        echo "Already visited during preflight phase:"
+        echo "   $canonical_root"
+        echo "Skipping duplicate/cyclic repository."
+
+        popd
+
+        return 0
+
+    fi
+
+
+    if [ -z "$PREFLIGHT_VISITED" ]; then
+
+        PREFLIGHT_VISITED="$canonical_root"
+
+    else
+
+        PREFLIGHT_VISITED="${PREFLIGHT_VISITED}"$'\n'"${canonical_root}"
+
+    fi
+
+
     echo
     echo "Preflight:"
     echo "   $git_root"
@@ -661,7 +893,8 @@ preflight_repository()
 
     if is_owned_remote "$current_remote"; then
 
-        repository_requires_merge "$configured_branch"
+        repository_requires_merge \
+            "$configured_branch"
 
         merge_status=$?
 
@@ -679,8 +912,7 @@ preflight_repository()
             else
 
                 #
-                # Root itself cannot be represented as an ordinary
-                # submodule path. Use ".".
+                # Root repository represented by ".".
                 #
 
                 echo "PENDING MERGE:"
@@ -693,7 +925,8 @@ preflight_repository()
         elif [ "$merge_status" -eq 2 ]; then
 
             echo
-            print_error "ERROR: Preflight could not verify the remote branch."
+            print_error \
+                "ERROR: Preflight could not verify the remote branch."
 
             popd
 
@@ -749,11 +982,18 @@ preflight_repository()
             fi
 
 
-            if [ -z "$root_relative_path" ]; then
+            if ! git -C "$submodule_path" \
+                rev-parse \
+                --is-inside-work-tree \
+                >/dev/null 2>&1; then
 
-                child_relative_path="$submodule_path"
+                continue
 
-            elif [ "$root_relative_path" = "." ]; then
+            fi
+
+
+            if [ -z "$root_relative_path" ] ||
+               [ "$root_relative_path" = "." ]; then
 
                 child_relative_path="$submodule_path"
 
@@ -789,25 +1029,28 @@ preflight_repository()
     popd
 
     return 0
+
 }
 
 
 #
-# ----------------------------------------------------------------------
+# ======================================================================
 # PHASE 3
 #
 # Push recursively, bottom-to-top.
 #
-# Only called when no pending merges exist.
-# ----------------------------------------------------------------------
+# Only executed when there are no pending merges.
+# ======================================================================
 #
 
 push_repository()
 {
+
     local directory="$1"
     local configured_branch="${2:-}"
 
     local git_root
+    local canonical_root
     local branch
 
     local key
@@ -841,6 +1084,46 @@ push_repository()
         return 1
 
     }
+
+
+    canonical_root=$(canonical_repository_root "$git_root") || {
+
+        popd
+
+        return 1
+
+    }
+
+
+    #
+    # Prevent recursive/cyclic repository traversal.
+    #
+
+    if repository_was_visited \
+        "$PUSH_VISITED" \
+        "$canonical_root"; then
+
+        echo
+        echo "Already visited during push phase:"
+        echo "   $canonical_root"
+        echo "Skipping duplicate/cyclic repository."
+
+        popd
+
+        return 0
+
+    fi
+
+
+    if [ -z "$PUSH_VISITED" ]; then
+
+        PUSH_VISITED="$canonical_root"
+
+    else
+
+        PUSH_VISITED="${PUSH_VISITED}"$'\n'"${canonical_root}"
+
+    fi
 
 
     #
@@ -882,6 +1165,16 @@ push_repository()
 
 
             if [ ! -d "$submodule_path" ]; then
+
+                continue
+
+            fi
+
+
+            if ! git -C "$submodule_path" \
+                rev-parse \
+                --is-inside-work-tree \
+                >/dev/null 2>&1; then
 
                 continue
 
@@ -935,7 +1228,8 @@ push_repository()
     fi
 
 
-    if ! verify_published_head "$branch"; then
+    if ! verify_published_head \
+        "$branch"; then
 
         popd
 
@@ -947,13 +1241,14 @@ push_repository()
     popd
 
     return 0
+
 }
 
 
 #
-# ----------------------------------------------------------------------
+# ======================================================================
 # Main
-# ----------------------------------------------------------------------
+# ======================================================================
 #
 
 if [ $# -ge 1 ]; then
@@ -971,7 +1266,8 @@ fi
 
 if [ -z "${BASEDIR:-}" ]; then
 
-    print_error "ERROR: Current directory is not inside a Git repository."
+    print_error \
+        "ERROR: Current directory is not inside a Git repository."
 
     exit 1
 
@@ -980,16 +1276,19 @@ fi
 
 pushd "$BASEDIR" || exit 1
 
+
 BASEDIR=$(git rev-parse \
     --show-toplevel \
     2>/dev/null || true)
+
 
 popd
 
 
 if [ -z "$BASEDIR" ]; then
 
-    print_error "ERROR: Specified directory is not inside a Git repository."
+    print_error \
+        "ERROR: Specified directory is not inside a Git repository."
 
     exit 1
 
@@ -1000,7 +1299,7 @@ ROOT_PENDING_FILE="$BASEDIR/$PENDING_MERGES_FILE"
 
 
 #
-# Prevent the operational file itself from being committed.
+# Remove old operational merge list before staging anything.
 #
 
 rm -f "$ROOT_PENDING_FILE"
@@ -1012,10 +1311,12 @@ echo "PHASE 1: Committing local changes recursively"
 echo "============================================================"
 
 
-if ! commit_repository "$BASEDIR"; then
+if ! commit_repository \
+    "$BASEDIR"; then
 
     echo
-    print_error "ERROR: Recursive commit phase failed."
+    print_error \
+        "ERROR: Recursive commit phase failed."
 
     exit 1
 
@@ -1028,6 +1329,10 @@ echo "PHASE 2: Checking for pending remote merges"
 echo "============================================================"
 
 
+#
+# Start fresh.
+#
+
 : > "$ROOT_PENDING_FILE"
 
 
@@ -1037,7 +1342,8 @@ if ! preflight_repository \
     ""; then
 
     echo
-    print_error "ERROR: Recursive preflight failed. Nothing was pushed."
+    print_error \
+        "ERROR: Recursive preflight failed. Nothing was pushed."
 
     exit 1
 
@@ -1062,10 +1368,30 @@ if [ -s "$ROOT_PENDING_FILE" ]; then
     echo "Run the merge wizard, then run commit again."
     echo "============================================================"
 
+
+    #
+    # IMPORTANT:
+    #
+    # Do NOT invoke:
+    #
+    #   checkout
+    #   merge
+    #   commit
+    #
+    # from here.
+    #
+    # Exit 2 means local commits succeeded, but remote history
+    # requires integration before pushing.
+    #
+
     exit 2
 
 fi
 
+
+#
+# No pending merges.
+#
 
 rm -f "$ROOT_PENDING_FILE"
 
@@ -1081,7 +1407,8 @@ if ! push_repository \
     ""; then
 
     echo
-    print_error "ERROR: Recursive push phase failed."
+    print_error \
+        "ERROR: Recursive push phase failed."
 
     exit 1
 
@@ -1089,6 +1416,14 @@ fi
 
 
 echo
-print_success "============================================================"
-print_success "Recursive commit and push completed successfully."
-print_success "============================================================"
+print_success \
+    "============================================================"
+
+print_success \
+    "Recursive commit and push completed successfully."
+
+print_success \
+    "============================================================"
+
+
+exit 0
