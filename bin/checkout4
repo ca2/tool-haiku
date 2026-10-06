@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+echo "=== Starting Recursive Git Submodule Update ==="
+
+# Initialize and sync submodules initially to ensure paths/URLs are mapped locally
+git submodule sync --recursive
+git submodule update --init --recursive
+
+# Iterate through every submodule recursively
+git submodule foreach --recursive '
+    # 1. Fetch the remote URL of the current submodule
+    SUBMODULE_URL=$(git config --get remote.origin.url || echo "")
+    
+    echo "--------------------------------------------------------"
+    echo "Entering submodule: $displaypath"
+    echo "Remote URL: $SUBMODULE_URL"
+    
+    # 2. Check if the submodule belongs to ca2 or cpp-port
+    if [[ "$SUBMODULE_URL" =~ "github.com/ca2" ]] || [[ "$SUBMODULE_URL" =~ "github.com/cpp-port" ]] || [[ "$SUBMODULE_URL" =~ "github.com:ca2" ]] || [[ "$SUBMODULE_URL" =~ "github.com/cpp-port" ]]; then
+        echo ">> Matching Target Submodule (ca2 / cpp-port) Found!"
+        
+        # Fetch latest remote changes safely
+        git fetch origin
+        
+        # Determine current local branch or default to main/master if detached
+        CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+        if [ "$CURRENT_BRANCH" = "HEAD" ]; then
+            # If in a detached HEAD, attempt to find standard defaults
+            if git show-ref --verify --quiet refs/remotes/origin/main; then
+                CURRENT_BRANCH="main"
+            elif git show-ref --verify --quiet refs/remotes/origin/master; then
+                CURRENT_BRANCH="master"
+            else
+                CURRENT_BRANCH="devel"
+            fi
+        fi
+        
+        echo ">> Checking out and pulling absolute latest code on branch: $CURRENT_BRANCH"
+        git checkout "$CURRENT_BRANCH"
+        git pull origin "$CURRENT_BRANCH"
+        
+    else
+        echo ">> Third-Party Submodule detected (Read-Only)."
+        echo ">> Checking out parent-selected tracking branch/commit..."
+        
+        # Fallback behavior: sync to the commit target hash recorded by the parent project
+        # This keeps the workspace stable without trying to write/push upstream tracking variations
+        git checkout --force $(git config -f $toplevel/.gitmodules submodule.$name.branch || echo HEAD)
+        git pull origin HEAD --quiet || true
+    fi
+'
+
+echo "========================================================"
+echo "=== Submodule codebase successfully processed! ==="
+echo "========================================================"

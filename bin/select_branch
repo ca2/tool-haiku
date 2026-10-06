@@ -1,0 +1,534 @@
+#!/usr/bin/env bash
+
+set -u
+
+
+ERROR_COLOR=""
+SUCCESS_COLOR=""
+ERROR_RESET=""
+SUCCESS_RESET=""
+
+
+if [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != "dumb" ]; then
+
+    if [ -t 2 ]; then
+        ERROR_COLOR=$'\033[1;31m'
+        ERROR_RESET=$'\033[0m'
+    fi
+
+    if [ -t 1 ]; then
+        SUCCESS_COLOR=$'\033[1;34m'
+        SUCCESS_RESET=$'\033[0m'
+    fi
+
+fi
+
+
+print_error()
+{
+    printf '%s%s%s\n' \
+        "$ERROR_COLOR" \
+        "$*" \
+        "$ERROR_RESET" >&2
+}
+
+
+print_success()
+{
+    printf '%s%s%s\n' \
+        "$SUCCESS_COLOR" \
+        "$*" \
+        "$SUCCESS_RESET"
+}
+
+
+cancel_selection()
+{
+    echo
+    echo "Branch selection cancelled."
+
+    exit 130
+}
+
+
+trap cancel_selection INT TERM
+
+
+ROOT=$(git rev-parse \
+    --show-toplevel \
+    2>/dev/null || true)
+
+
+if [ -z "$ROOT" ]; then
+
+    print_error "ERROR: Current directory is not inside a Git repository."
+
+    exit 1
+
+fi
+
+
+cd "$ROOT" || exit 1
+
+
+PAGE_SIZE="${SELECT_BRANCH_PAGE_SIZE:-}"
+
+
+if [ -z "$PAGE_SIZE" ]; then
+
+    terminal_lines=$(tput lines 2>/dev/null || true)
+
+
+    if [[ "$terminal_lines" =~ ^[0-9]+$ ]] &&
+       [ "$terminal_lines" -gt 10 ]; then
+
+        PAGE_SIZE=$((terminal_lines - 8))
+
+    else
+
+        PAGE_SIZE=20
+
+    fi
+
+fi
+
+
+if ! [[ "$PAGE_SIZE" =~ ^[0-9]+$ ]] ||
+   [ "$PAGE_SIZE" -lt 1 ]; then
+
+    print_error "ERROR: SELECT_BRANCH_PAGE_SIZE must be a positive integer."
+
+    exit 1
+
+fi
+
+
+declare -a BRANCH_TYPES
+declare -a BRANCH_REFS
+declare -a BRANCH_LABELS
+
+
+load_branches()
+{
+    local branch
+    local local_name
+
+
+    BRANCH_TYPES=()
+    BRANCH_REFS=()
+    BRANCH_LABELS=()
+
+
+    while IFS= read -r branch; do
+
+        if [ -z "$branch" ]; then
+            continue
+        fi
+
+
+        BRANCH_TYPES+=("local")
+        BRANCH_REFS+=("$branch")
+        BRANCH_LABELS+=("$branch")
+
+
+    done < <(
+        git for-each-ref \
+            --sort=refname \
+            --format='%(refname:short)' \
+            refs/heads
+    )
+
+
+    while IFS= read -r branch; do
+
+        if [ -z "$branch" ] ||
+           [[ "$branch" != */* ]] ||
+           [[ "$branch" == */HEAD ]]; then
+
+            continue
+
+        fi
+
+
+        local_name="${branch#*/}"
+
+
+        #
+        # The local branch is already the natural selectable entry.
+        # Only add remote branches that do not have a local counterpart.
+        #
+
+        if git show-ref \
+            --verify \
+            --quiet \
+            "refs/heads/$local_name"; then
+
+            continue
+
+        fi
+
+
+        BRANCH_TYPES+=("remote")
+        BRANCH_REFS+=("$branch")
+        BRANCH_LABELS+=("$branch [remote]")
+
+
+    done < <(
+        git for-each-ref \
+            --sort=refname \
+            --format='%(refname:short)' \
+            refs/remotes
+    )
+}
+
+
+record_selected_branch_in_parent()
+{
+    local selected_branch="$1"
+    local superproject
+    local gitmodules_path
+    local root_physical
+    local key
+    local submodule_path
+    local submodule_name=""
+    local candidate_physical
+
+
+    superproject=$(git rev-parse \
+        --show-superproject-working-tree \
+        2>/dev/null || true)
+
+
+    #
+    # A normal standalone repository has no parent in which to record
+    # the selection.
+    #
+
+    if [ -z "$superproject" ]; then
+        return 0
+    fi
+
+
+    gitmodules_path="$superproject/.gitmodules"
+
+
+    if [ ! -f "$gitmodules_path" ]; then
+
+        print_error "ERROR: The superproject has no .gitmodules file."
+        echo "   $superproject"
+
+        return 1
+
+    fi
+
+
+    root_physical=$(cd "$ROOT" && pwd -P)
+
+
+    while IFS=' ' read -r key submodule_path; do
+
+        if [ -z "${key:-}" ] ||
+           [ -z "${submodule_path:-}" ]; then
+
+            continue
+
+        fi
+
+
+        candidate_physical=$(cd \
+            "$superproject/$submodule_path" \
+            2>/dev/null && pwd -P || true)
+
+
+        if [ "$candidate_physical" != "$root_physical" ]; then
+            continue
+        fi
+
+
+        submodule_name="${key#submodule.}"
+        submodule_name="${submodule_name%.path}"
+
+        break
+
+
+    done < <(
+        git -C "$superproject" config \
+            --file .gitmodules \
+            --get-regexp '^submodule\..*\.path$' \
+            2>/dev/null || true
+    )
+
+
+    if [ -z "$submodule_name" ]; then
+
+        print_error "ERROR: Could not find this repository in its parent's .gitmodules file."
+        echo "   Repository : $ROOT"
+        echo "   Parent     : $superproject"
+
+        return 1
+
+    fi
+
+
+    if ! git -C "$superproject" config \
+        --file .gitmodules \
+        "submodule.${submodule_name}.branch" \
+        "$selected_branch"; then
+
+        print_error "ERROR: Could not record the selected branch in the parent."
+        echo "   Parent : $superproject"
+        echo "   Branch : $selected_branch"
+
+        return 1
+
+    fi
+
+
+    echo "Recorded selected branch in parent:"
+    echo "   Repository : $superproject"
+    echo "   Submodule  : $submodule_path"
+    echo "   Branch     : $selected_branch"
+}
+
+
+show_page()
+{
+    local start="$1"
+    local end="$2"
+    local current_branch="$3"
+    local index
+    local marker
+
+
+    echo
+    echo "Branches in:"
+    echo "   $ROOT"
+    echo
+
+
+    for ((index = start; index < end; index++)); do
+
+        marker=" "
+
+
+        if [ "${BRANCH_TYPES[$index]}" = "local" ] &&
+           [ "${BRANCH_REFS[$index]}" = "$current_branch" ]; then
+
+            marker="*"
+
+        fi
+
+
+        printf '%s %4d) %s\n' \
+            "$marker" \
+            "$((index + 1))" \
+            "${BRANCH_LABELS[$index]}"
+
+    done
+
+
+    echo
+}
+
+
+select_branch()
+{
+    local index="$1"
+    local type="${BRANCH_TYPES[$index]}"
+    local ref="${BRANCH_REFS[$index]}"
+    local selected_branch
+
+
+    echo
+    echo "Selecting branch:"
+    echo "   $ref"
+    echo
+
+
+    if [ "$type" = "local" ]; then
+
+        git checkout "$ref" || return 1
+
+    else
+
+        git checkout --track "$ref" || return 1
+
+    fi
+
+
+    selected_branch=$(git symbolic-ref \
+        --quiet \
+        --short HEAD \
+        2>/dev/null || true)
+
+
+    if [ -z "$selected_branch" ]; then
+
+        print_error "ERROR: Checkout did not leave the repository on a branch."
+
+        return 1
+
+    fi
+
+
+    record_selected_branch_in_parent \
+        "$selected_branch" || return 1
+
+
+    print_success "Branch selected successfully: $selected_branch"
+
+    return 0
+}
+
+
+while true; do
+
+    load_branches
+
+
+    branch_count=${#BRANCH_REFS[@]}
+
+
+    if [ "$branch_count" -eq 0 ]; then
+
+        print_error "ERROR: No local or remote branches were found."
+
+        exit 1
+
+    fi
+
+
+    current_branch=$(git symbolic-ref \
+        --quiet \
+        --short HEAD \
+        2>/dev/null || true)
+
+    page_start=0
+
+
+    while [ "$page_start" -lt "$branch_count" ]; do
+
+        page_end=$((page_start + PAGE_SIZE))
+
+
+        if [ "$page_end" -gt "$branch_count" ]; then
+
+            page_end="$branch_count"
+
+        fi
+
+
+        show_page \
+            "$page_start" \
+            "$page_end" \
+            "$current_branch"
+
+
+        if [ "$page_end" -lt "$branch_count" ]; then
+
+            prompt="More branches: Enter continues, number selects, q quits: "
+
+        else
+
+            prompt="Select 1-$branch_count, Enter lists again, q quits: "
+
+        fi
+
+
+        printf '%s' "$prompt"
+
+
+        if ! IFS= read -r answer; then
+
+            echo
+            echo "End of input. No branch selected."
+
+            exit 0
+
+        fi
+
+
+        case "$answer" in
+
+            q|Q)
+
+                echo "No branch selected."
+
+                exit 0
+                ;;
+
+
+            "")
+
+                if [ "$page_end" -lt "$branch_count" ]; then
+
+                    page_start="$page_end"
+
+                    continue
+
+                fi
+
+
+                break
+                ;;
+
+
+            *[!0-9]*)
+
+                echo "Invalid selection: $answer"
+                echo "Enter a displayed number, press Enter, or enter q."
+
+                break
+                ;;
+
+
+            *)
+
+                if [ "$answer" -lt 1 ] ||
+                   [ "$answer" -gt "$branch_count" ]; then
+
+                    echo "Selection is outside the range 1-$branch_count."
+
+                    break
+
+                fi
+
+
+                if select_branch "$((answer - 1))"; then
+
+                    exit 0
+
+                fi
+
+
+                echo
+                print_error "ERROR: Branch selection failed. The repository was not switched."
+                echo "Press Enter to list the branches again, or enter q to quit."
+                printf '> '
+
+
+                if ! IFS= read -r retry_answer; then
+
+                    echo
+
+                    exit 1
+
+                fi
+
+
+                if [ "$retry_answer" = "q" ] ||
+                   [ "$retry_answer" = "Q" ]; then
+
+                    exit 1
+
+                fi
+
+
+                break
+                ;;
+
+        esac
+
+    done
+
+done
