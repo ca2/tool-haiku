@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+TEST_WORK=$(mktemp -d)
+
+# Load the real recursive functions without running the commit/push entry point.
+# Strip Windows checkout line endings when running under Git Bash.
+source <(sed -e 's/\r$//' -e '/^# Main$/,$d' "$SCRIPT_ROOT/bin/commit")
+
+export GIT_ALLOW_PROTOCOL=file
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$TEST_WORK/gitconfig"
+printf '%s\n' 'commit recursion regression test' > "$TEST_WORK/message"
+DEDICATORY_FILE="$TEST_WORK/message"
+
+init_repository()
+{
+    git init --quiet --initial-branch=main "$1"
+    git -C "$1" config user.name 'Commit Recursion Test'
+    git -C "$1" config user.email 'commit-recursion@example.invalid'
+    git -C "$1" commit --quiet --allow-empty -m initial
+}
+
+add_submodule_entry()
+{
+    local repository="$1"
+    local path="$2"
+    local url="$3"
+
+    git -C "$repository" config --file .gitmodules submodule.child.path "$path"
+    git -C "$repository" config --file .gitmodules submodule.child.url "$url"
+    git -C "$repository" add .gitmodules
+    git -C "$repository" commit --quiet -m 'submodule declaration'
+}
+
+run_phase()
+{
+    local phase="$1"
+    local repository="$2"
+
+    # A broken implementation must fail this test rather than loop forever.
+    FUNCNEST=24
+    ROOT_PENDING_FILE="$TEST_WORK/pending"
+    : > "$ROOT_PENDING_FILE"
+
+    case "$phase" in
+        commit) commit_repository "$repository" ;;
+        preflight) preflight_repository "$repository" "" "" ;;
+        push) push_repository "$repository" "" ;;
+    esac
+}
+
+expect_rejection()
+{
+    local phase="$1"
+    local repository="$2"
+    local diagnostic="$3"
+    local log="$TEST_WORK/$phase"
+    local before_head
+    local before_index
+    local status=0
+
+    before_head=$(git -C "$repository" rev-parse HEAD)
+    before_index=$(git -C "$repository" write-tree)
+
+    (run_phase "$phase" "$repository") > "$log.stdout" 2> "$log.stderr" || status=$?
+
+    if [ "$status" -eq 0 ] || ! grep -Fq "$diagnostic" "$log.stderr"; then
+        echo "FAIL: $phase did not reject the invalid traversal with: $diagnostic" >&2
+        cat "$log.stderr" >&2
+        return 1
+    fi
+
+    test "$(git -C "$repository" rev-parse HEAD)" = "$before_head"
+    test "$(git -C "$repository" write-tree)" = "$before_index"
+
+    echo "PASS: $phase rejected $diagnostic"
+}
+
+# Removing the root check makes Git discover the parent of this empty directory.
+init_repository "$TEST_WORK/uninitialized"
+mkdir "$TEST_WORK/uninitialized/child with spaces"
+add_submodule_entry "$TEST_WORK/uninitialized" 'child with spaces' \
+    https://github.com/ca2/child.git
+
+for phase in commit preflight push; do
+    expect_rejection "$phase" "$TEST_WORK/uninitialized" \
+        'ERROR: Expected an independent Git repository'
+done
+
+# External children must not silently resolve to the parent's HEAD either.
+init_repository "$TEST_WORK/external"
+mkdir "$TEST_WORK/external/vendor"
+add_submodule_entry "$TEST_WORK/external" vendor https://github.com/third-party/vendor.git
+expect_rejection commit "$TEST_WORK/external" \
+    'ERROR: Expected an independent Git repository'
+
+# This path is a real repository root, but is already active in the traversal.
+init_repository "$TEST_WORK/cycle"
+add_submodule_entry "$TEST_WORK/cycle" . https://github.com/ca2/cycle.git
+
+for phase in commit preflight push; do
+    expect_rejection "$phase" "$TEST_WORK/cycle" \
+        'ERROR: Recursive repository cycle detected'
+done
+
+# Real initialized submodules have .git files, and must still work bottom-up.
+for name in leaf middle parent; do
+    git init --quiet --bare --initial-branch=main "$TEST_WORK/$name.git"
+    init_repository "$TEST_WORK/$name"
+    git -C "$TEST_WORK/$name" remote add origin "$TEST_WORK/$name.git"
+    git -C "$TEST_WORK/$name" push --quiet -u origin main
+done
+
+git -C "$TEST_WORK/middle" -c protocol.file.allow=always \
+    submodule add --quiet --name leaf "$TEST_WORK/leaf.git" 'leaf with spaces'
+git -C "$TEST_WORK/middle" commit --quiet -am 'add leaf'
+git -C "$TEST_WORK/middle" push --quiet origin main
+git -C "$TEST_WORK/parent" -c protocol.file.allow=always \
+    submodule add --quiet "$TEST_WORK/middle.git" child
+git -C "$TEST_WORK/parent" -c protocol.file.allow=always \
+    submodule update --init --recursive --quiet
+git -C "$TEST_WORK/parent" commit --quiet -am 'add middle'
+git -C "$TEST_WORK/parent" push --quiet origin main
+
+git -C "$TEST_WORK/parent" config submodule.child.url https://github.com/ca2/middle.git
+git -C "$TEST_WORK/parent/child" config submodule.leaf.url \
+    https://github.com/cpp-port/leaf.git
+
+for repository in "$TEST_WORK/parent/child" "$TEST_WORK/parent/child/leaf with spaces"; do
+    git -C "$repository" config user.name 'Commit Recursion Test'
+    git -C "$repository" config user.email 'commit-recursion@example.invalid'
+done
+
+printf '%s\n' 'new leaf content' > "$TEST_WORK/parent/child/leaf with spaces/change.txt"
+printf '%s\n' 'new parent content' > "$TEST_WORK/parent/change.txt"
+test -f "$TEST_WORK/parent/child/.git"
+test -f "$TEST_WORK/parent/child/leaf with spaces/.git"
+
+(
+    # Sharing visit state across phases must not produce a false cycle.
+    run_phase commit "$TEST_WORK/parent"
+    run_phase preflight "$TEST_WORK/parent"
+    test ! -s "$ROOT_PENDING_FILE"
+    run_phase push "$TEST_WORK/parent"
+) > "$TEST_WORK/valid.log" 2>&1
+
+test -z "$(git -C "$TEST_WORK/parent" status --porcelain)"
+for name in parent middle leaf; do
+    case "$name" in
+        parent) repository="$TEST_WORK/parent" ;;
+        middle) repository="$TEST_WORK/parent/child" ;;
+        leaf) repository="$TEST_WORK/parent/child/leaf with spaces" ;;
+    esac
+    test "$(git -C "$repository" rev-parse HEAD)" = \
+        "$(git -C "$TEST_WORK/$name.git" rev-parse refs/heads/main)"
+done
+
+echo 'PASS: valid nested submodules committed and published bottom-up in all three phases'
+echo "Test artifacts: $TEST_WORK"
