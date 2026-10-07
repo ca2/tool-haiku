@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-logicalCpuCount=$(psrinfo | wc -l)
+logicalCpuCount=$(nproc --all)
 
 build_parallelization=$((logicalCpuCount - 1))
 
