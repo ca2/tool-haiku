@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_ROOT=$(cd "$(dirname "$0")/.." && pwd)
+
+# Load only tool-selection functions; never run the merge wizard.
+eval "$(sed -n '/^select_mergetool()/,/^# Pending merge file/p' "$SCRIPT_ROOT/bin/merge" | sed '$d')"
+
+print_error() { printf '%s\n' "$*" >&2; }
+uname() { printf '%s\n' "$TEST_OS"; }
+git() { printf '%s' "$TEST_CONFIG"; }
+mergetool_is_available() { [[ " $TEST_AVAILABLE " == *" $1 "* ]]; }
+
+check_selection()
+{
+    local expected="$1"
+    select_mergetool
+    if [ "$MERGE_TOOL" != "$expected" ]; then
+        printf 'Expected %s, got %s\n' "$expected" "$MERGE_TOOL" >&2
+        exit 1
+    fi
+}
+
+TEST_OS=Haiku
+TEST_CONFIG=meld
+TEST_AVAILABLE='kdiff3 vimdiff nvimdiff'
+SSH_CONNECTION=''
+SSH_TTY=''
+MERGE_TOOL=''
+check_selection kdiff3
+
+MERGE_TOOL=''
+SSH_CONNECTION='test connection'
+check_selection vimdiff
+
+MERGE_TOOL=''
+TEST_AVAILABLE='kdiff3 nvimdiff'
+check_selection nvimdiff
+
+MERGE_TOOL=''
+TEST_AVAILABLE=kdiff3
+check_selection '(none available)'
+
+# Valid Git configuration and explicit overrides retain priority.
+MERGE_TOOL=''
+TEST_CONFIG=custom
+TEST_AVAILABLE=custom
+check_selection custom
+
+MERGE_TOOL=explicit
+check_selection explicit
+
+MERGE_TOOL=''
+TEST_CONFIG=''
+TEST_OS=Linux
+TEST_AVAILABLE='meld kdiff3 vimdiff'
+check_selection meld
+
+printf 'Merge tool selection tests passed.\n'

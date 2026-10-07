@@ -9,7 +9,8 @@ set -u
 # ----------------------------------------------------------------------
 #
 
-MERGE_TOOL="${MERGE_TOOL:-meld}"
+# An explicit override takes priority over Git configuration and auto-detection.
+MERGE_TOOL="${MERGE_TOOL:-}"
 
 PENDING_FILE="commit_pending_merges.txt"
 DEDICATORY_FILE="$HOME/dedicatory.txt"
@@ -505,7 +506,7 @@ show_conflicts()
 ensure_mergetool_available()
 {
 
-    if command -v "$MERGE_TOOL" >/dev/null 2>&1; then
+    if [ -n "$MERGE_TOOL" ] && mergetool_is_available "$MERGE_TOOL"; then
 
         return 0
 
@@ -526,8 +527,64 @@ ensure_mergetool_available()
     echo
     echo "   MERGE_TOOL=kdiff3 merge"
 
+    if [ "$(uname -s)" = "Haiku" ]; then
+        echo
+        echo "Haiku packages: pkgman install vim, neovim, or kdiff3"
+        echo "Use vimdiff or nvimdiff over SSH; KDiff3 opens on the Haiku desktop."
+    fi
+
     return 1
 
+}
+
+
+mergetool_is_available()
+(
+    # Use Git's own validation, including tool aliases, .path and custom .cmd.
+    # Keep the library's variables and IFS isolated from the merge wizard.
+    set +eu
+    TOOL_MODE=merge
+    . "$(git --exec-path)/git-mergetool--lib" || exit 1
+    get_merge_tool_path "$1" >/dev/null 2>&1
+)
+
+
+select_mergetool()
+{
+    local candidate
+    local candidates
+
+    [ -n "$MERGE_TOOL" ] && return 0
+
+    MERGE_TOOL=$(git config --get merge.tool 2>/dev/null || true)
+    if [ -n "$MERGE_TOOL" ]; then
+        if mergetool_is_available "$MERGE_TOOL"; then
+            return 0
+        fi
+
+        print_error "Configured merge tool '$MERGE_TOOL' is unavailable; looking for an installed tool."
+        MERGE_TOOL=""
+    fi
+
+    if [ "$(uname -s)" = "Haiku" ]; then
+        if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then
+            candidates="vimdiff nvimdiff"
+        else
+            candidates="kdiff3 vimdiff nvimdiff meld"
+        fi
+    else
+        candidates="meld kdiff3 vimdiff nvimdiff"
+    fi
+
+    for candidate in $candidates; do
+        if mergetool_is_available "$candidate"; then
+            MERGE_TOOL="$candidate"
+            return 0
+        fi
+    done
+
+    # Report installation instructions only if a file conflict needs a tool.
+    MERGE_TOOL="(none available)"
 }
 
 
@@ -1630,6 +1687,7 @@ echo "============================================================"
 echo "ca2 Guided Merge Wizard"
 echo "============================================================"
 echo
+select_mergetool
 echo "Merge tool (used only for ordinary file conflicts):"
 echo "   $MERGE_TOOL"
 echo
