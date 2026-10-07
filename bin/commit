@@ -64,6 +64,103 @@ popd()
 }
 
 
+#
+# Track canonical repository roots separately for each recursive phase.
+# An indexed array also works on Bash versions without associative arrays.
+#
+
+VISITED_REPOSITORIES=()
+
+
+get_exact_repository_root()
+{
+    local directory="$1"
+    local requested_root
+    local git_root
+
+
+    requested_root=$(
+        cd "$directory" 2>/dev/null && pwd -P
+    ) || {
+
+        print_error "ERROR: Cannot access repository directory: $directory"
+
+        return 1
+    }
+
+
+    git_root=$(git -C "$requested_root" rev-parse \
+        --show-toplevel 2>/dev/null || true)
+
+    if [ -z "$git_root" ]; then
+
+        print_error "ERROR: Not a Git repository: $requested_root"
+
+        return 1
+
+    fi
+
+
+    git_root=$(
+        cd "$git_root" 2>/dev/null && pwd -P
+    ) || {
+
+        print_error "ERROR: Cannot resolve Git repository root: $requested_root"
+
+        return 1
+    }
+
+
+    #
+    # Git searches parent directories when a submodule is uninitialized.
+    # Being inside a work tree does not prove this is its own repository.
+    #
+
+    if [ "$requested_root" != "$git_root" ]; then
+
+        print_error "ERROR: Expected an independent Git repository."
+        printf '   Requested path : %s\n' "$requested_root" >&2
+        printf '   Git root       : %s\n' "$git_root" >&2
+        print_error "The submodule may be missing or not initialized correctly."
+
+        return 1
+
+    fi
+
+
+    printf '%s\n' "$git_root"
+}
+
+
+mark_repository_visited()
+{
+    local phase="$1"
+    local git_root="$2"
+    local visit_key="${phase}:${git_root}"
+    local visited_key
+
+
+    for visited_key in "${VISITED_REPOSITORIES[@]-}"; do
+
+        if [ "$visited_key" = "$visit_key" ]; then
+
+            print_error "ERROR: Recursive repository cycle detected."
+            printf '   Phase      : %s\n' "$phase" >&2
+            printf '   Repository : %s\n' "$git_root" >&2
+
+            return 1
+
+        fi
+
+    done
+
+
+    VISITED_REPOSITORIES+=("$visit_key")
+
+    return 0
+}
+
+
 is_owned_remote()
 {
     local url="$1"
@@ -334,15 +431,16 @@ commit_repository()
     pushd "$directory" || return 1
 
 
-    git_root=$(git rev-parse \
-        --show-toplevel \
-        2>/dev/null || true)
+    git_root=$(get_exact_repository_root ".") || {
+
+        popd
+
+        return 1
+
+    }
 
 
-    if [ -z "$git_root" ]; then
-
-        print_error "ERROR: Not a Git repository:"
-        echo "   $directory"
+    if ! mark_repository_visited "commit" "$git_root"; then
 
         popd
 
@@ -399,12 +497,12 @@ commit_repository()
             fi
 
 
-            if ! git -C "$submodule_path" \
-                rev-parse \
-                --is-inside-work-tree \
-                >/dev/null 2>&1; then
+            if ! get_exact_repository_root \
+                "$submodule_path" >/dev/null; then
 
-                continue
+                popd
+
+                return 1
 
             fi
 
@@ -626,12 +724,16 @@ preflight_repository()
     pushd "$directory" || return 1
 
 
-    git_root=$(git rev-parse \
-        --show-toplevel \
-        2>/dev/null || true)
+    git_root=$(get_exact_repository_root ".") || {
+
+        popd
+
+        return 1
+
+    }
 
 
-    if [ -z "$git_root" ]; then
+    if ! mark_repository_visited "preflight" "$git_root"; then
 
         popd
 
@@ -820,12 +922,16 @@ push_repository()
     pushd "$directory" || return 1
 
 
-    git_root=$(git rev-parse \
-        --show-toplevel \
-        2>/dev/null || true)
+    git_root=$(get_exact_repository_root ".") || {
+
+        popd
+
+        return 1
+
+    }
 
 
-    if [ -z "$git_root" ]; then
+    if ! mark_repository_visited "push" "$git_root"; then
 
         popd
 
