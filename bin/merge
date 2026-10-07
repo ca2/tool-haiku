@@ -557,11 +557,18 @@ select_mergetool()
     [ -n "$MERGE_TOOL" ] && return 0
 
     MERGE_TOOL=$(git config --get merge.tool 2>/dev/null || true)
-    [ -n "$MERGE_TOOL" ] && return 0
+    if [ -n "$MERGE_TOOL" ]; then
+        if mergetool_is_available "$MERGE_TOOL"; then
+            return 0
+        fi
+
+        print_error "Configured merge tool '$MERGE_TOOL' is unavailable; looking for an installed tool."
+        MERGE_TOOL=""
+    fi
 
     if [ "$(uname -s)" = "Haiku" ]; then
         if [ -n "${SSH_CONNECTION:-}${SSH_TTY:-}" ]; then
-            candidates="vimdiff nvimdiff kdiff3 meld"
+            candidates="vimdiff nvimdiff"
         else
             candidates="kdiff3 vimdiff nvimdiff meld"
         fi
