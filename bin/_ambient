@@ -5,7 +5,7 @@ if [ -z "$__SYSTEM" ]; then
 
    # envbasename=`basename $SHELL`
 
-   # ENV="$HOME/.${envbasename}rc"
+   # ENV="$HOME/config/settings/${envbasename}rc"
 
    # export ENV
 

@@ -1,13 +1,13 @@
 
-if [ -f ~/.bashrc ]; then
-    . ~/.bashrc
+if [ -f ~/config/settings/bashrc ]; then
+    . ~/config/settings/bashrc
 fi
 
 . $HOME/application/integration/code/.operating_system_summary
 
 # envbasename=`basename $SHELL`
 
-# ENV="$HOME/.${envbasename}rc"
+# ENV="$HOME/config/settings/${envbasename}rc"
 
 # export ENV
 
