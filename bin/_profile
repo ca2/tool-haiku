@@ -1,4 +1,8 @@
 
+if [ -f ~/.bashrc ]; then
+    . ~/.bashrc
+fi
+
 . $HOME/application/integration/code/.operating_system_summary
 
 # envbasename=`basename $SHELL`
