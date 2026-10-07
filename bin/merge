@@ -538,11 +538,40 @@ ensure_mergetool_available()
 }
 
 
+merge_tool_git()
+{
+    local executable
+
+    # HaikuPorts installs the GUI as apps/KDiff3, outside the usual bin path.
+    # Keep explicit Git paths and custom commands authoritative.
+    if [ "$(uname -s)" = "Haiku" ] &&
+       [ -z "$(command git config --get mergetool.kdiff3.path 2>/dev/null)" ] &&
+       [ -z "$(command git config --get mergetool.kdiff3.cmd 2>/dev/null)" ]; then
+        executable=$(command -v KDiff3 2>/dev/null || true)
+        if [ -z "$executable" ]; then
+            for executable in /boot/home/config/non-packaged/apps/KDiff3 \
+                              /boot/home/config/apps/KDiff3 \
+                              /boot/system/non-packaged/apps/KDiff3 \
+                              /boot/system/apps/KDiff3; do
+                [ -x "$executable" ] && break
+            done
+        fi
+        if [ -n "$executable" ] && [ -x "$executable" ]; then
+            command git -c "mergetool.kdiff3.path=$executable" "$@"
+            return $?
+        fi
+    fi
+
+    command git "$@"
+}
+
+
 mergetool_is_available()
 (
     # Use Git's own validation, including tool aliases, .path and custom .cmd.
     # Keep the library's variables and IFS isolated from the merge wizard.
     set +eu
+    git() { merge_tool_git "$@"; }
     TOOL_MODE=merge
     . "$(git --exec-path)/git-mergetool--lib" || exit 1
     get_merge_tool_path "$1" >/dev/null 2>&1
@@ -1240,7 +1269,7 @@ resolve_conflicts_wizard()
         echo
 
 
-        git mergetool \
+        merge_tool_git mergetool \
             --tool="$MERGE_TOOL" \
             --no-prompt \
             -- "$conflict_file"
